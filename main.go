@@ -1,9 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,31 +22,86 @@ type loginRequest struct {
 }
 
 func main() {
+	logger := log.New(os.Stderr, "", log.LstdFlags|log.Lmsgprefix)
+
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
-		log.Fatal("JWT_SECRET must be set")
+		logger.Fatal("JWT_SECRET must be set")
 	}
 
-	config := auth.Config{
-		Secret:   []byte(secret),
-		Issuer:   "go-gin-jwt-token",
-		TokenTTL: 24 * time.Hour,
+	config, err := loadConfig(secret, logger)
+	if err != nil {
+		logger.Fatal(err)
 	}
 
 	router := newRouter(config)
-	if err := router.Run(); err != nil {
-		log.Fatal(err)
+	server := &http.Server{
+		Addr:              envDefault("LISTEN_ADDR", ":8080"),
+		Handler:           router,
+		ReadHeaderTimeout: 5 * time.Second, // Slowloris protection
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	// Graceful shutdown on SIGINT/SIGTERM.
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		stop := make(chan os.Signal, 1)
+		signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+		<-stop
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			logger.Printf("graceful shutdown failed: %v", err)
+		}
+	}()
+
+	logger.Printf("listening on %s", server.Addr)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Fatal(err)
+	}
+	<-shutdownDone
+}
+
+func loadConfig(secret string, logger *log.Logger) (auth.Config, error) {
+	ttlMinutes, err := strconv.Atoi(envDefault("JWT_TTL_MINUTES", "15"))
+	if err != nil || ttlMinutes <= 0 {
+		return auth.Config{}, errors.New("JWT_TTL_MINUTES must be a positive integer")
+	}
+	skewSeconds, err := strconv.Atoi(envDefault("JWT_CLOCK_SKEW_SECONDS", "60"))
+	if err != nil || skewSeconds < 0 {
+		return auth.Config{}, errors.New("JWT_CLOCK_SKEW_SECONDS must be a non-negative integer")
+	}
+
+	return auth.Config{
+		Secret:    []byte(secret),
+		Issuer:    envDefault("JWT_ISSUER", "go-gin-jwt-token"),
+		Audience:  os.Getenv("JWT_AUDIENCE"),
+		TokenTTL:  time.Duration(ttlMinutes) * time.Minute,
+		ClockSkew: time.Duration(skewSeconds) * time.Second,
+		Logger:    logger,
+	}, nil
+}
+
+func envDefault(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func newRouter(jwtConfig auth.Config) *gin.Engine {
 	router := gin.Default()
+	router.GET("/healthz", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 	router.POST("/login", loginHandler(jwtConfig))
 
 	protected := router.Group("/")
 	protected.Use(auth.Middleware(jwtConfig))
 	protected.GET("/profile", func(c *gin.Context) {
-		claims := c.MustGet("jwtClaims").(*auth.Claims)
+		claims := auth.ClaimsFrom(c)
 		c.JSON(http.StatusOK, gin.H{"username": claims.Username})
 	})
 
@@ -56,8 +116,10 @@ func loginHandler(jwtConfig auth.Config) gin.HandlerFunc {
 			return
 		}
 
-		// Replace this demonstration check with your database/password-hash verification.
-		if request.Username != "demo" || request.Password != "demo-password" {
+		// Demonstration credentials only — replace with a database lookup that
+		// verifies a bcrypt/argon2 hash of the stored password.
+		if !auth.ConstantTimeCompare(request.Username, "demo") ||
+			!auth.ConstantTimeCompare(request.Password, "demo-password") {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
 			return
 		}
@@ -67,6 +129,10 @@ func loginHandler(jwtConfig auth.Config) gin.HandlerFunc {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create token"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"token": token, "token_type": "Bearer", "expires_in": int(jwtConfig.TokenTTL.Seconds())})
+		c.JSON(http.StatusOK, gin.H{
+			"token":      token,
+			"token_type": "Bearer",
+			"expires_in": int(jwtConfig.TokenTTL.Seconds()),
+		})
 	}
 }
